@@ -1,14 +1,26 @@
 const axios = require("axios");
+const { SecretManagerServiceClient } = require("@google-cloud/secret-manager");
 
-exports.app = (req, res) => {
+const client = new SecretManagerServiceClient();
+let quick_email_api_key, slack_access_token;
+
+async function accessSecretVersion() {
+  const [version] = await client.accessSecretVersion({
+    name: process.env.SECRET_RESOURCE_ID,
+  });
+  data = JSON.parse(version.payload.data);
+  quick_email_api_key = data.quick_email_api_key;
+  slack_access_token = data.slack_access_token;
+}
+
+exports.mailo = async (req, res) => {
+  await accessSecretVersion();
+
   if (req.body.challenge) return res.status(200).send(req.body.challenge);
 
   if (req.body.command) {
     res.status(200).send(`I'll get back to you later with results`);
     handleCommand(req.body);
-    console.log("---------------------COMMAND-------------------------");
-    console.log(req.body);
-    console.log("-----------------------END---------------------------");
     return;
   }
 
@@ -18,9 +30,6 @@ exports.app = (req, res) => {
     const eventData = req.body.event;
     const { bot_id, type, text, channel, ...rest } = eventData;
     if (eventData && !bot_id) {
-      console.log("----------------------EVENT--------------------------");
-      console.log(req.body);
-      console.log("-----------------------END---------------------------");
       handleEvent(type, text, channel);
     }
   }
@@ -44,12 +53,14 @@ function handleCommand(data) {
     text,
     channel_id: channel,
     user_id: user,
-    response_url
+    response_url,
   } = data;
 
   switch (command) {
     case "/mailo":
-      replyWithVerificationResults(text, channel, response_url);
+      splittedText = text.split(/\s+/);
+      splittedText[0] == "" && splittedText.shift();
+      extractAndReply(splittedText, channel, false, response_url);
       break;
     default:
       break;
@@ -57,47 +68,70 @@ function handleCommand(data) {
 }
 
 async function handleAppMentionEvent(text, channel) {
-  let splittedText = text.split(" ");
-  const email = extractEmail(splittedText[1]);
-  replyWithVerificationResults(email, channel);
+  let splittedText = text.split(/\s+/);
+  splittedText.shift();
+  extractAndReply(splittedText, channel);
 }
 
 async function handleMessageEvent(text, channel) {
-  let splittedText = text.split(" ");
-  if (splittedText[0] === "!verify") {
-    const email = extractEmail(splittedText[1]);
-    replyWithVerificationResults(email, channel);
+  let splittedText = text.split(/\s+/);
+  if (splittedText[0] === "!mailo") {
+    splittedText.shift();
+    extractAndReply(splittedText, channel);
   }
 }
 
-const postMessageUrl = "https://slack.com/api/chat.postMessage";
-
-const postMessageConfig = {
-  method: "post",
-  url: postMessageUrl,
-  headers: {
-    "Content-type": "application/json",
-    Authorization: `Bearer ${process.env.BOT_TOKEN}`
+async function extractAndReply(
+  emails,
+  channel,
+  extract = true,
+  response_url = ""
+) {
+  const dataForReply = [];
+  if (emails.length == 0) {
+    dataForReply.push({
+      error: {
+        message: "Provide an email to verify",
+      },
+    });
+  } else {
+    for (let email of emails) {
+      const extractedEmail = extract ? extractEmail(email) : email;
+      dataForReply.push(await getVerificationResults(extractedEmail));
+    }
   }
-};
+  reply(dataForReply, channel, response_url);
+}
+
+function getPostMessageConfig() {
+  const postMessageUrl = "https://slack.com/api/chat.postMessage";
+  return {
+    method: "post",
+    url: postMessageUrl,
+    headers: {
+      "Content-type": "application/json",
+      Authorization: `Bearer ${slack_access_token}`,
+    },
+  };
+}
 
 function replyToChannel(reply, channel) {
   axios({
-    ...postMessageConfig,
+    ...getPostMessageConfig(),
     data: {
       channel,
-      ...reply
-    }
+      ...reply,
+    },
   });
 }
 
 function replyToUrl(reply, url) {
   axios({
-    ...postMessageConfig,
+    ...getPostMessageConfig(),
     url,
     data: {
-      ...reply
-    }
+      ...reply,
+    },
   });
 }
 
@@ -113,16 +147,24 @@ function verifyEmailLocally(email) {
   return email.match(/^\S+@\S+\.\S+$/);
 }
 
-async function replyWithVerificationResults(email, channel, response_url) {
+async function getVerificationResults(email) {
+  if (verifyEmailLocally(email)) {
+    let responses = await initVerification(email);
+    return categorizeResponse(responses);
+  } else {
+    return {
+      email: email,
+      error: {
+        message: "Invalid e-mail format.",
+      },
+    };
+  }
+}
+
+function reply(data, channel, response_url) {
   const reply = response_url ? replyToUrl : replyToChannel;
   const to = response_url ? response_url : channel;
-  if (!email) return reply({ text: "Provide an email to verify" }, to);
-  if (verifyEmailLocally(email)) {
-    let response = await initVerification(email);
-    return reply(makeResponseBeautiful(email, response), to);
-  } else {
-    return reply({ text: `Incorrect e-mail format.` }, to);
-  }
+  reply(makeResponseBeautiful(data), to);
 }
 
 async function initVerification(email) {
@@ -131,55 +173,144 @@ async function initVerification(email) {
     responses.push(verifyEmail(email));
   }
   return Promise.all(responses).then((values) => {
-    let results = values.map((val) => val.result);
-    return results;
+    return values;
   });
 }
 
 async function verifyEmail(email) {
   try {
     let response = await axios.get(
-      `http://api.quickemailverification.com/v1/verify?email=${email}&apikey=${process.env.API_KEY}`
+      `http://api.quickemailverification.com/v1/verify?email=${email}&apikey=${quick_email_api_key}`
     );
     return response.data;
   } catch (err) {
-    console.log(err.response.status);
+    console.log(err.response);
     return {
-      result: err.response.statusText
+      error: {
+        status: err.response.status,
+        message: err.response.statusText,
+      },
     };
   }
 }
 
-function makeResponseBeautiful(email, response) {
-  let valid = 0;
-  let invalid = 0;
-  for (r of response) {
-    if (r === "valid") {
-      valid++;
-    } else {
-      invalid++;
+function categorizeResponse(responses) {
+  let categorized = {};
+  for (let item of responses) {
+    if (item.error !== undefined) {
+      categorized.error = item.error;
+      continue;
+    }
+    for (let key in item) {
+      if (categorized[item.email] !== undefined) {
+        if (categorized[item.email][key] !== undefined) {
+          if (categorized[item.email][key][item[key]] !== undefined) {
+            categorized[item.email][key][item[key]] += 1;
+          } else {
+            categorized[item.email][key][item[key]] = 1;
+          }
+        } else {
+          categorized[item.email][key] = {};
+          categorized[item.email][key][item[key]] = 1;
+        }
+      } else {
+        categorized[item.email] = {};
+        categorized[item.email][key] = {};
+        categorized[item.email][key][item[key]] = 1;
+      }
+    }
+  }
+  return categorized;
+}
+
+function makeResponseBeautiful(responses) {
+  let invalidKeys = ["reason"];
+  let validKeys = ["safe_to_send", "accept_all"];
+  let textsArray = [];
+
+  for (let response of responses) {
+    let text = "";
+    if (response.error) {
+      if (response.email !== undefined) {
+        text += `Results for \`${response.email}\` \n\n`;
+      }
+      text += `\`Error:\` ${response.error.message} \n\n`;
+      textsArray.push(text);
+      continue;
+    }
+
+    let email = Object.keys(response)[0];
+    let emailData = response[email];
+    let containsInvalid = false;
+
+    text += `Email: \`${email}\` \n`;
+
+    if (Object.keys(emailData.result).includes("valid")) {
+      text += `\`Valid:\` ${emailData.result.valid} ${validOrInvalidText(
+        "valid"
+      )}`;
+    }
+
+    for (let key in emailData.result) {
+      if (key === "valid") continue;
+      containsInvalid = true;
+      text += `\`${key}\`: ${emailData.result[key]}, `;
+    }
+    text += `${validOrInvalidText("invalid")}`;
+
+    textsArray.push(text);
+
+    function validOrInvalidText(type) {
+      let keysArray = type === "valid" ? validKeys : invalidKeys;
+      let tempText = "";
+
+      for (let key in emailData) {
+        if (!containsInvalid && key === "reason") continue;
+        if (keysArray.includes(key) && emailData[key] !== undefined) {
+          for (let subkey in emailData[key]) {
+            switch (type) {
+              case "valid":
+                if (subkey == "true") {
+                  tempText += `\`${key}:\` ${emailData[key][subkey]}, `;
+                } else if (subkey == "false") {
+                  break;
+                } else {
+                  tempText += `\`${key}:\` ${subkey}: ${emailData[key][subkey]}, `;
+                }
+                break;
+              default:
+                if (
+                  emailData[key][subkey] !== undefined &&
+                  subkey !== "accepted_email"
+                ) {
+                  tempText += `\`${subkey}:\` ${emailData[key][subkey]}, `;
+                }
+            }
+          }
+        }
+      }
+      return `${tempText}\n`;
     }
   }
 
-  return {
-    blocks: [
+  blocks = [];
+
+  textsArray.forEach((text) => {
+    blocks.push(
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `Results for \`${email}\`: \n\n *Valid: \`${valid}\` Invalid: \`${invalid}\`*`
-        }
+          text: text,
+        },
       },
       {
-        type: "divider"
-      },
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `All checks: [${response.join(", ")}]`
-        }
+        type: "divider",
       }
-    ]
+    );
+  });
+
+  return {
+    blocks: blocks,
   };
 }
