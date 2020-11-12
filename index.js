@@ -2,7 +2,8 @@ require("dotenv").config();
 const axios = require("axios");
 const express = require("express");
 const app = express();
-const PORT = 3002;
+const PORT = 3001;
+const MAX_CHECKS = 10;
 
 app.use(express.json());
 app.use(express.urlencoded());
@@ -165,33 +166,16 @@ function reply(data, channel, response_url) {
 
 async function initVerification(email) {
   let responses = [];
-  const TOTAL = 10;
 
   async function singleResponse(step) {
-    res = await verifyEmail(email);
-    // if (step == 3) {
-    //   console.log(res);
-    //   res.result = "valid";
-    // }
-    responses.push(res);
-    if (step < TOTAL && res.result === "unknown") {
-      //   console.log(`Checking ${step} time`);
+    response = await verifyEmail(email);
+    responses.push(response);
+
+    if (step < MAX_CHECKS && response.result === "unknown") {
       await singleResponse(++step);
     }
   }
-
   await singleResponse(1);
-
-  //   responses[0].reason = "siaip sau";
-  //   responses[3].reason = "siaip sau";
-  //   responses[4].reason = "siaip sau";
-  //   responses[9].reason = "siaip sau";
-  //   responses[1].reason = "Uh lala";
-
-  //   responses.forEach((r) => {
-  //     console.log(r.reason);
-  //   });
-
   return responses;
 }
 
@@ -311,7 +295,7 @@ function makeResponseBeautiful(responses) {
     }
   }
 
-  blocks = [];
+  let blocks = [];
 
   textsArray.forEach((text) => {
     blocks.push(
